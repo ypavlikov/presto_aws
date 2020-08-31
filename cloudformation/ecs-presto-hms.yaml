@@ -1,0 +1,899 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Presto and Hive Metastore
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "ECS Configuration"
+        Parameters:
+          - EcsClusterName
+          - DeploymentEnv
+          - KeyName
+          - DailyMaxSize
+          - DailyMinSize
+          - DarknessMaxSize
+          - DarknessMinSize
+          - SystemVolumeSize
+          - SpillVolumeSize
+      -
+        Label:
+          default: "Less Variative"
+        Parameters:
+          - PrestoDockerImage
+          - HiveMetastoreServiceDockerImage
+          - EcsAmiParameterKey
+          - HiveMetastoreServiceUsername
+      -
+        Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PrestoPort
+          - HiveMetastoreServicePort
+          - AlbSecurityGroup
+          - PrestoAccessSecurityGroup
+Parameters:
+# NETWORK
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Identifier
+  PrestoPort:
+    Type: Number
+    Default: 8080
+    Description: Ingress Port for Presto cluster
+  HiveMetastoreServicePort:
+    Type: Number
+    Default: 9083
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group used by the load balancer to access Presto coordinator
+  CoordAlbCertificateArn:
+    Type: String
+    Description: ARN for the Coordinator application load balancer 
+  PrestoAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group attached to the Superset or Hue instance to access Presto coordinator
+  EcsSubnets:
+    Type: String
+    Description: Comma delited list of subnets for the Elasctic Container Service 
+  AlbSubnetIds:
+    Type: String
+    Description: Comma delited list of subnets for the coordinator's application load balancer
+# ASG
+  DailyMaxSize:
+    Type: Number
+    Default: 350
+  DailyMinSize:
+    Type: Number
+    Default: 200
+  DarknessMaxSize:
+    Type: Number
+    Default: 200
+  DarknessMinSize:
+    Type: Number
+    Default: 100
+  KeyName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: Specifies the name of an existing Amazon EC2 key pair to enable SSH access to the EC2 instances in your cluster.
+  SystemVolumeSize:
+    Type: Number
+    Description: Specifies the Size in GBs of the system volume
+    Default: 50
+  SpillVolumeSize:
+    Type: Number
+    Description: Specifies the Size in GBs, of the spill volume
+    Default: 300
+  IamRoleInstanceProfile:
+    Type: String
+    Description: IAM role for coordinator and worker 
+
+# ECS
+  DeploymentEnv:
+    Type: String
+    Default: prod
+    AllowedValues: 
+      - prod
+      - dev
+  EcsClusterName:
+    Type: String
+    Description: >
+      Specifies the ECS Cluster Name with which the resources would be associated
+    Default: 'presto-prod'
+  EcsAmiParameterKey:
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+    Description: SSM Parameter Store String containing the Latest ECS Baked image
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  PrestoDockerImage:
+    Type: String
+  HiveMetastoreServiceDockerImage:
+    Type: String
+  HiveMetastoreServiceUsername:
+    Type: String
+    Default: hiveserver
+    Description: Username to connect to hive meta-store RDS instance
+
+# Mappings
+Mappings: 
+  EnvMap: 
+    prod:
+      TagDeploymentEnv: "Production"
+      CoordinatorInstanceType: "c5.9xlarge"             #   72.0 GiB   36 vCPUs  EBS only        10 Gigabit
+      WorkerInstanceType: "m5a.8xlarge"                 #  128.0 GiB   32 vCPUs  EBS only        Up to 10 Gigabit
+      OnDemandBaseCapacity: 10
+      WorkeCpuReservation: 32768
+      WorkerMemoryReservation: 126115
+      CoordCpuReservation: 28000
+      CoordMemoryReservation: 50000
+      HivePartitionsPerScan: 32
+      PrestoSpillPath: /data/presto
+      WorkerStopTimeout: 600
+    dev: 
+      TagDeploymentEnv: "Development"
+      CoordinatorInstanceType: "c5.4xlarge"             #   36.0 GiB   16 vCPUs  EBS only  Up to 10 Gigabit
+      WorkerInstanceType: "m5a.4xlarge"                 #   64.0 GiB   16 vCPUs  EBS only  Up to 10 Gigabit
+      OnDemandBaseCapacity: 1
+      WorkeCpuReservation: 16000
+      WorkerMemoryReservation: 60000
+      CoordCpuReservation: 9200
+      CoordMemoryReservation: 15000
+      HivePartitionsPerScan: 32
+      PrestoSpillPath: /data/presto
+      WorkerStopTimeout: 300
+
+Conditions:
+  CreateEC2LCWithKeyPair: !Not [!Equals [!Ref KeyName, '']]
+  DevEnv:                 !Equals [!Ref DeploymentEnv, 'dev']
+  ProdEnv:                !Equals [!Ref DeploymentEnv, 'prod']
+
+Resources:
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Presto Ec2 Instance Security Group
+      VpcId: !Ref 'VpcId'
+      SecurityGroupIngress:
+        -
+          IpProtocol: 'tcp'
+          FromPort: !Ref 'PrestoPort'
+          ToPort: !Ref 'PrestoPort'
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        -
+          IpProtocol: 'tcp'
+          FromPort: !Ref 'PrestoPort'
+          ToPort: !Ref 'PrestoPort'
+          SourceSecurityGroupId: !Ref PrestoAccessSecurityGroup
+        -
+          IpProtocol: 'tcp'
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 10.0.0.0/8
+      SecurityGroupEgress:
+        -
+          IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: 'Name', Value: !Join [' ', ['ECS', !Ref 'EcsClusterName', '-', 'ECS SecurityGroup']] }
+        - { Key: 'Description', Value: !Join [' ', ['ECS cluster', !Ref 'EcsClusterName']] }
+
+  EcsSecurityGroupIngress: 
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: EcsSecurityGroup
+    Properties: 
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: -1
+      FromPort: '8080'
+      ToPort: '8080'
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+  # A L B  for  Coordinator
+  CoordElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join [ "-", [ !Ref EcsClusterName, "alb-private" ] ]
+      Scheme: internal
+      Subnets: !Split ["," , !Ref AlbSubnetIds]
+      SecurityGroups: [ !Ref AlbSecurityGroup ]
+  CoordLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - 
+          Type: forward
+          TargetGroupArn: !Ref CoordTargetGroup
+      LoadBalancerArn: !Ref CoordElasticLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates: 
+        - CertificateArn: !FindInMap [EnvMap, !Ref DeploymentEnv, CoordAlbCertificateArn]
+      SslPolicy: "ELBSecurityPolicy-2016-08"
+  CoordLoadBalancerListenerDev:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: DevEnv
+    Properties:
+      DefaultActions:
+        - 
+          Type: forward
+          TargetGroupArn: !Ref CoordTargetGroup
+      LoadBalancerArn: !Ref CoordElasticLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  CoordListenerRule:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig: 
+            StatusCode: 503
+            ContentType: text/plain
+            MessageBody: "Access denied"
+      Conditions:
+        - Field: "path-pattern"
+          PathPatternConfig:
+            Values: [ "/api" ]
+      ListenerArn: !If [ ProdEnv, !Ref CoordLoadBalancerListener, !Ref CoordLoadBalancerListenerDev ]
+      Priority: 1
+  CoordTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: CoordElasticLoadBalancer
+    Properties:
+      Name: !Join [ "-", [ !Ref EcsClusterName, "TargetGroup" ] ]
+      HealthCheckIntervalSeconds: 120
+      HealthCheckPath: "/ui/login.html"
+      HealthCheckPort: !Ref PrestoPort
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds : 110
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 10
+      TargetType: ip
+      Port: !Ref PrestoPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetGroupAttributes:
+        -
+          Key: deregistration_delay.timeout_seconds
+          Value: 0
+  # A S G 
+  WorkerLaunchTemplateDemand:
+    Type: AWS::EC2::LaunchTemplate
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    Properties:
+      LaunchTemplateName: !Join ['-', ['de', !Ref 'EcsClusterName', 'worker-ondemand', !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerInstanceType]]]
+      LaunchTemplateData:
+        EbsOptimized: false
+        IamInstanceProfile:
+          Arn: !FindInMap [EnvMap, !Ref DeploymentEnv, IamRoleInstanceProfile]
+        ImageId: !Ref EcsAmiParameterKey
+        InstanceType: !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerInstanceType]
+        KeyName: !If [ CreateEC2LCWithKeyPair, !Ref KeyName, !Ref "AWS::NoValue" ]
+        SecurityGroupIds:
+          - !Ref 'EcsSecurityGroup'
+        BlockDeviceMappings:
+              - DeviceName: '/dev/xvda'
+                Ebs:
+                  VolumeSize: !Ref SystemVolumeSize
+                  VolumeType: gp2
+              - DeviceName: '/dev/xvdb'
+                Ebs:
+                  VolumeSize: !Ref SpillVolumeSize
+                  VolumeType: gp2
+        TagSpecifications:
+          - ResourceType: volume
+            Tags: 
+              - { Key: Name, Value: !Sub "ECS Presto Worker - ${AWS::StackName}" }
+              - { Key: Deployment_Environment, Value: !FindInMap [EnvMap, !Ref DeploymentEnv, TagDeploymentEnv] }
+              - { Key: Stack, Value: Presto }
+              - { Key: Profile, Value: presto_worker }
+        UserData: 
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            echo ECS_CLUSTER=${EcsClusterName} >> /etc/ecs/ecs.config;
+            echo ECS_ENABLE_SPOT_INSTANCE_DRAINING = true >> /etc/ecs/ecs.config;
+
+  CoordinatorLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Join ['-', ['de', !Ref 'EcsClusterName', 'coordinator', !FindInMap [EnvMap, !Ref DeploymentEnv, CoordinatorInstanceType]]]
+      LaunchTemplateData:
+        EbsOptimized: true
+        IamInstanceProfile:
+          Arn: !FindInMap [EnvMap, !Ref DeploymentEnv, IamRoleInstanceProfile]
+        ImageId: !Ref EcsAmiParameterKey
+        InstanceType: !FindInMap [EnvMap, !Ref DeploymentEnv, CoordinatorInstanceType]
+        KeyName: !If [ CreateEC2LCWithKeyPair, !Ref KeyName, !Ref "AWS::NoValue" ]
+        SecurityGroupIds:
+          - !Ref 'EcsSecurityGroup'
+        BlockDeviceMappings:
+              - DeviceName: '/dev/xvda'
+                Ebs:
+                  VolumeSize: !Ref SystemVolumeSize
+                  VolumeType: gp2
+              - DeviceName: '/dev/xvdb'
+                Ebs:
+                  VolumeSize: !Ref SpillVolumeSize
+                  VolumeType: gp2
+        TagSpecifications:
+          - ResourceType: volume
+            Tags: 
+              - { Key: Name, Value: !Sub "ECS Presto Worker - ${AWS::StackName}" }
+              - { Key: Deployment_Environment, Value: !FindInMap [EnvMap, !Ref DeploymentEnv, TagDeploymentEnv] }
+              - { Key: Stack, Value: Presto }
+              - { Key: Profile, Value: presto_worker }
+        UserData: 
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            echo ECS_CLUSTER=${EcsClusterName} >> /etc/ecs/ecs.config;
+
+  WorkerAsgOnDemand:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Join ['-', [!Ref 'EcsClusterName', 'worker-ondemand']]
+      VPCZoneIdentifier: 
+        - !Ref EcsSubnets
+      MinSize: !Ref DailyMinSize
+      MaxSize: !Ref DailyMaxSize
+      DesiredCapacity: !Ref DailyMinSize
+      Cooldown: 900  # minimize zombie effects
+      #PlacementGroup: !Ref PrestoPlacementGroup
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: 
+            - GroupInServiceInstances
+            - GroupTotalInstances
+            - GroupTerminatingInstances
+            - GroupStandbyInstances
+            - GroupDesiredCapacity
+            - GroupMaxSize
+            - GroupMinSize
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplateDemand
+        Version: !GetAtt WorkerLaunchTemplateDemand.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub "ECS Presto Worker - ${AWS::StackName}", PropagateAtLaunch: 'true' }
+        - { Key: Description, Value: "This instance is the part of Presto Auto Scaling Group", PropagateAtLaunch: 'true' }
+        - { Key: Deployment_Environment, Value: !FindInMap [EnvMap, !Ref DeploymentEnv, TagDeploymentEnv], PropagateAtLaunch: 'true' }
+        - { Key: Stack, Value: Presto, PropagateAtLaunch: 'true' }
+        - { Key: Profile, Value: presto_worker, PropagateAtLaunch: 'true' }
+  WorkerScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties: 
+      AutoScalingGroupName: !Ref WorkerAsgOnDemand
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 120
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 75
+
+  CoordinatorAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Join ['-', [!Ref 'EcsClusterName', 'coordinator']]
+      VPCZoneIdentifier:
+        - !Ref EcsSubnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref CoordinatorLaunchTemplate
+        Version: !GetAtt CoordinatorLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      #PlacementGroup: !Ref PrestoPlacementGroup
+      Cooldown: 0
+      Tags:
+        - { Key: Name, Value: !Sub "ECS Presto Coordinator - ${AWS::StackName}", PropagateAtLaunch: 'true' }
+        - { Key: Description, Value: "This instance is the part of Presto Auto Scaling Group", PropagateAtLaunch: 'true' }
+        - { Key: Deployment_Environment, Value: !FindInMap [EnvMap, !Ref DeploymentEnv, TagDeploymentEnv], PropagateAtLaunch: 'true' }
+        - { Key: Stack, Value: Presto, PropagateAtLaunch: 'true' }
+        - { Key: Profile, Value: presto_coordinator, PropagateAtLaunch: 'true' }
+
+  ScheduledActionOut: 
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref WorkerAsgOnDemand
+      MaxSize: !Ref DailyMaxSize
+      MinSize: !Ref DailyMinSize
+      DesiredCapacity: !Ref DailyMinSize
+      Recurrence: "0 14 * * MON-FRI"
+  ScheduledActionIn:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref WorkerAsgOnDemand  
+      MaxSize: !Ref DarknessMaxSize
+      MinSize: !Ref DarknessMinSize
+      DesiredCapacity: !Ref DarknessMaxSize  # when scaling in, make sure we are not killing instances
+      Recurrence: "0 2 * * *"
+
+  #
+  # E C S   C L U S T E R 
+  #
+
+  EscPresto:
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Ref EcsClusterName
+      ClusterSettings:
+        -
+          Name: containerInsights
+          Value: enabled
+      Tags: 
+        - { Key: Name, Value: !Sub "ECS Presto - ${AWS::StackName}" }
+        - { Key: Deployment_Environment, Value: Production }
+        - { Key: Stack, Value: Presto }
+
+  Coordinator: 
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: awsvpc
+      TaskRoleArn: !FindInMap [EnvMap, !Ref DeploymentEnv, EcsTaskRole]
+      ContainerDefinitions: 
+        - 
+          Name: "presto-coordinator"
+          Image: !Ref PrestoDockerImage
+          Cpu: !FindInMap [EnvMap, !Ref DeploymentEnv, CoordCpuReservation]
+          MemoryReservation: !FindInMap [EnvMap, !Ref DeploymentEnv, CoordMemoryReservation]
+          PortMappings:
+            -
+              ContainerPort: !Ref PrestoPort
+          Essential: true
+          StopTimeout: 15
+          Ulimits:
+            -
+              Name: nofile          
+              SoftLimit: 131072
+              HardLimit: 131072
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+                awslogs-create-group: true
+                awslogs-group: !Join [ "", [ "/ecs/", !Ref EcsClusterName, "PrestoCoordinator" ]]
+                awslogs-region: !Ref "AWS::Region"
+                awslogs-stream-prefix: "ecs"
+          Environment:
+            - { Name: COORDINATOR, Value: localhost }
+            - { Name: IS_COORDINATOR, Value: true }
+      Family: !Join ["-", ["presto-coordinator-task", !Ref DeploymentEnv]]
+
+  Worker: 
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: host
+      TaskRoleArn: !FindInMap [EnvMap, !Ref DeploymentEnv, EcsTaskRole]
+      ContainerDefinitions: 
+        - 
+          Name: !Join ["-", ["presto-worker", !Ref DeploymentEnv]]
+          Image: !Ref PrestoDockerImage
+          Cpu: !FindInMap [EnvMap, !Ref DeploymentEnv, WorkeCpuReservation] # 32768
+          MemoryReservation: !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerMemoryReservation]  # 126115
+          StopTimeout: !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerStopTimeout]
+          Essential: true
+          PortMappings:
+            -
+              ContainerPort: !Ref PrestoPort
+          MountPoints: 
+            -
+              ContainerPath: "/data/presto"
+              SourceVolume: "datadir"
+              ReadOnly: False
+          Ulimits:
+            -
+              Name: nofile          
+              SoftLimit: 131072
+              HardLimit: 131072
+          Environment:
+            - { Name: COORDINATOR, Value: !Join ['', [ !Ref EcsClusterName, '.presto.example.com' ]] }
+            - { Name: IS_COORDINATOR, Value: false }
+      Volumes:
+        - 
+          Host: 
+            SourcePath: "/data/presto"
+          Name: "datadir"
+      Family: !Join ["-", ["presto-worker-task", !Ref DeploymentEnv]]
+
+  DataDog:
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: host
+      TaskRoleArn: ecsTaskExecutionRole
+      ContainerDefinitions:
+        -
+          Name: datadog-agent
+          Image: "datadog/agent:latest"
+          Cpu: 200
+          Memory: 200
+          Essential: True
+          MountPoints: 
+            -
+              ContainerPath: "/opt/datadog-agent/run"
+              SourceVolume: "pointdir"
+              ReadOnly: False
+            -
+              ContainerPath: "/var/run/docker.sock"
+              SourceVolume: "docker_sock"
+              ReadOnly: True
+            -
+              ContainerPath: "/host/sys/fs/cgroup"
+              SourceVolume: "cgroup"
+              ReadOnly: True
+            -
+              ContainerPath: "/host/proc"
+              SourceVolume: "proc"
+              ReadOnly: True            
+          Environment:
+            - { Name: DD_SITE,                              Value: datadoghq.com }
+            - { Name: DD_LOGS_ENABLED,                      Value: True }
+            - { Name: DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL, Value: True }
+            - { Name: DD_ECS_COLLECT_RESOURCE_TAGS_EC2,     Value: True }
+      Volumes:
+        - 
+          Host: 
+            SourcePath: "/opt/datadog-agent/run"
+          Name: "pointdir"
+        -
+          Host:
+            SourcePath: "/var/run/docker.sock"
+          Name: "docker_sock"
+        -
+          Host: 
+            SourcePath: "/proc/"
+          Name: "proc"
+        -
+          Host:
+            SourcePath: "/cgroup/"
+          Name: "cgroup"
+      Family: !Join ["-", ["datadog-agent-task", !Ref DeploymentEnv]]
+
+
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for Presto Clusters
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: A
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: !Ref EcsClusterName
+      NamespaceId: ns-luvdrc5gattznj4u
+
+  CoordinatorService:
+    Type: AWS::ECS::Service
+    DependsOn: CoordLoadBalancerListener
+    Properties:
+      ServiceName: presto-coordinator
+      TaskDefinition: !Ref Coordinator
+      DesiredCount: 1
+      Cluster: !Ref EscPresto
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      LoadBalancers:
+        -
+          ContainerName: presto-coordinator
+          ContainerPort: !Ref PrestoPort
+          TargetGroupArn: !Ref CoordTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref 'EcsSecurityGroup'
+          Subnets: 
+            - !Ref EcsSubnet
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+      PlacementConstraints: 
+        -
+          Expression: 'attribute:ecs.instance-type=~c5.*'
+          Type: memberOf
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+    - CoordinatorService
+    Properties:
+      ServiceName: presto-worker
+      TaskDefinition: !Ref Worker
+      DesiredCount: !Ref DailyMinSize
+      Cluster: !Ref EscPresto
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MaximumPercent: 110
+        MinimumHealthyPercent: 90
+      PlacementConstraints: 
+        -
+          Expression: !Join ['', ['attribute:ecs.instance-type=~', !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerInstanceType]]]
+          Type: memberOf
+
+  DatadogService:
+    Type: AWS::ECS::Service
+    DependsOn:
+    - DataDog
+    Properties:
+      ServiceName: datadog
+      TaskDefinition: !Ref DataDog
+      DesiredCount: 1
+      Cluster: !Ref EscPresto
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      PlacementConstraints: 
+        -
+          Expression: !Join ['', ['attribute:ecs.instance-type=~', !FindInMap [EnvMap, !Ref DeploymentEnv, CoordinatorInstanceType]]]
+          Type: memberOf
+  
+  # Hive
+
+  HiveMetastore: 
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: awsvpc
+      TaskRoleArn:  !FindInMap [EnvMap, !Ref DeploymentEnv, EcsTaskRole]
+      ExecutionRoleArn: !FindInMap [EnvMap, !Ref DeploymentEnv, EcsTaskRole]
+      ContainerDefinitions: 
+        - 
+          Name: "hive-metastore-service"
+          Image: !Ref HiveMetastoreServiceDockerImage
+          Cpu: 6384
+          MemoryReservation: 15000
+          PortMappings:
+            -
+              ContainerPort: !Ref HiveMetastoreServicePort
+          Essential: true
+          Environment:
+            - { Name: HIVE_METASTORE_USER, Value: !Ref HiveMetastoreServiceUsername }
+          Ulimits:
+            -
+              Name: nofile          
+              SoftLimit: 131072
+              HardLimit: 131072
+      Family: !Join ["-", ["hive-metastore", !Ref DeploymentEnv]]
+
+  HiveDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for Hive MetaStoreService
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: A
+      HealthCheckCustomConfig: 
+        FailureThreshold: 3
+      Name: !Join ["-", ["hive", !Ref DeploymentEnv]]
+
+      NamespaceId: ns-luvdrc5gattznj4u
+
+  HiveMetastoreService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: hive-metastore-service
+      TaskDefinition: !Ref HiveMetastore
+      DesiredCount: 1
+      Cluster: !Ref EscPresto
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref 'EcsSecurityGroup'
+          Subnets:
+            - !Ref EcsSubnets
+      ServiceRegistries:
+        - RegistryArn: !GetAtt HiveDiscoveryService.Arn
+      PlacementConstraints: 
+        -
+          Expression: !Join ['', ['attribute:ecs.instance-type=~', !FindInMap [EnvMap, !Ref DeploymentEnv, CoordinatorInstanceType]]]
+          Type: memberOf
+
+# Lifecycle Hook 
+
+  SNSLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "autoscaling.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+      Path: "/"
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Policies:
+        -
+          PolicyName: "lambda-inline"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                - autoscaling:CompleteLifecycleAction
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - ecs:ListContainerInstances
+                - ecs:DescribeContainerInstances
+                - ecs:UpdateContainerInstancesState
+                - ec2:DescribeInstances
+                - ec2:DescribeNetworkInterfaces
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+                - ec2:DescribeInstances
+                - ec2:AttachNetworkInterface
+                - sns:Publish
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+      Path: "/"
+  ASGSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        -
+          Endpoint:
+             Fn::GetAtt:
+                - "LambdaFunctionForASG"
+                - "Arn"
+          Protocol: "lambda"
+    DependsOn: "LambdaFunctionForASG"
+  LambdaFunctionForASG:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Gracefully drain ECS tasks from EC2 instances before the instances are
+                   terminated by autoscaling.
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.6
+      MemorySize: 128
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref 'EcsSecurityGroup'
+        SubnetIds:
+          - !Ref EcsSubnets
+      Code:
+        ZipFile: !Sub |
+          from botocore.vendored import requests
+          import json
+          import time
+          import boto3
+          CLUSTER = '${EcsClusterName}'
+          REGION = '${AWS::Region}'
+          ECS = boto3.client('ecs', region_name=REGION)
+          ASG = boto3.client('autoscaling', region_name=REGION)
+          SNS = boto3.client('sns', region_name=REGION)
+          EC2 = boto3.client('ec2', region_name=REGION)
+          def instance_shutdown_presto(instance_id):
+            response = EC2.describe_instances(InstanceIds=[instance_id])
+            for r in response["Reservations"]:
+              hostname = r["Instances"][0]["PrivateIpAddress"]
+              break
+            if not hostname:
+              print('Instance not found, exiting...')
+              return 1
+            headers = {'content-type': 'application/json'}
+            url = 'http://{}:8080/v1/info/state'.format(hostname)
+            print(url)
+            print(requests.put(url, headers=headers,
+                              data='"SHUTTING_DOWN"', verify=False).text)
+            return 0
+          def find_ecs_instance_info(instance_id):
+              paginator = ECS.get_paginator('list_container_instances')
+              for list_resp in paginator.paginate(cluster=CLUSTER):
+                  arns = list_resp['containerInstanceArns']
+                  desc_resp = ECS.describe_container_instances(cluster=CLUSTER,
+                                                              containerInstances=arns)
+                  for container_instance in desc_resp['containerInstances']:
+                      if container_instance['ec2InstanceId'] != instance_id:
+                          continue
+                      print('Found instance: id=%s, arn=%s, status=%s, runningTasksCount=%s' %
+                            (instance_id, container_instance['containerInstanceArn'],
+                            container_instance['status'], container_instance['runningTasksCount']))
+                      return (container_instance['containerInstanceArn'],
+                              container_instance['status'], container_instance['runningTasksCount'])
+              return None, None, 0
+          def instance_has_running_tasks(instance_id):
+              (instance_arn, container_status,
+              running_tasks) = find_ecs_instance_info(instance_id)
+              if instance_arn is None:
+                  print('Could not find instance ID %s. Letting autoscaling kill the instance.' %
+                        (instance_id))
+                  return False
+              if container_status != 'DRAINING':
+                  print('Setting container instance %s (%s) to DRAINING' %
+                        (instance_id, instance_arn))
+                  ECS.update_container_instances_state(cluster=CLUSTER,
+                                                      containerInstances=[instance_arn],
+                                                      status='DRAINING')
+                  instance_shutdown_presto(instance_id)
+              return running_tasks > 0
+          def lambda_handler(event, context):
+              msg = json.loads(event['Records'][0]['Sns']['Message'])
+              print(msg)
+              if 'LifecycleTransition' not in msg.keys() or \
+                      msg['LifecycleTransition'].find('autoscaling:EC2_INSTANCE_TERMINATING') == -1:
+                  print('Exiting since the lifecycle transition is not EC2_INSTANCE_TERMINATING.')
+                  return
+              if instance_has_running_tasks(msg['EC2InstanceId']):
+                  print('Tasks are still running on instance %s; posting msg to SNS topic %s' %
+                        (msg['EC2InstanceId'], event['Records'][0]['Sns']['TopicArn']))
+                  time.sleep(5)
+                  sns_resp = SNS.publish(TopicArn=event['Records'][0]['Sns']['TopicArn'],
+                                        Message=json.dumps(msg),
+                                        Subject='Publishing SNS msg to invoke Lambda again.')
+                  print('Posted msg %s to SNS topic.' % (sns_resp['MessageId']))
+              else:
+                  print('No tasks are running on instance %s; setting lifecycle to complete' %
+                        (msg['EC2InstanceId']))
+                  ASG.complete_lifecycle_action(LifecycleHookName=msg['LifecycleHookName'],
+                                                AutoScalingGroupName=msg['AutoScalingGroupName'],
+                                                LifecycleActionResult='CONTINUE',
+                                                InstanceId=msg['EC2InstanceId'])
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+       FunctionName: !Ref LambdaFunctionForASG
+       Action: lambda:InvokeFunction
+       Principal: "sns.amazonaws.com"
+       SourceArn: !Ref ASGSNSTopic
+  LambdaSubscriptionToSNSTopic:
+    Type: AWS::SNS::Subscription
+    Properties:
+       Endpoint:
+          Fn::GetAtt:
+             - "LambdaFunctionForASG"
+             - "Arn"
+       Protocol: 'lambda'
+       TopicArn: !Ref ASGSNSTopic
+  ASGTerminateHook:
+    Type: "AWS::AutoScaling::LifecycleHook"
+    Properties:
+      AutoScalingGroupName: !Ref WorkerAsgOnDemand
+      DefaultResult: "ABANDON"
+      HeartbeatTimeout: !FindInMap [EnvMap, !Ref DeploymentEnv, WorkerStopTimeout]
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      NotificationTargetARN: !Ref ASGSNSTopic
+      RoleARN:
+         Fn::GetAtt:
+         - "SNSLambdaRole"
+         - "Arn"
+    DependsOn: "ASGSNSTopic"
+Outputs:
+  EscPrestoName:
+    Description: ECS Presto Cluster
+    Value: !Ref EscPresto
+  CoordinatorLoadBalancerDns:
+    Description: DNS of the Coordinator's Load Balancer
+    Value: !GetAtt CoordElasticLoadBalancer.DNSName
